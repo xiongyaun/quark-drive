@@ -2,6 +2,7 @@ mod auth;
 mod client;
 mod error;
 mod models;
+pub mod native_sms;
 mod session;
 
 pub use auth::{QrLogin, QrLoginConfig, QrLoginPoll, QR_LOGIN_TTL_MS};
