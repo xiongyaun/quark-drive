@@ -15,7 +15,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
-#[command(name = "quark-probe", version, about = "夸克网盘协议探针与命令行工具")]
+#[command(name = "quark-probe", version, about = "夸克网盘 Ubuntu 命令行客户端")]
 struct Args {
     #[arg(long, env = "QUARK_COOKIE", hide_env_values = true)]
     cookie: Option<String>,

@@ -3,6 +3,9 @@ name = "quark-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "夸克网盘 Ubuntu 命令行客户端"
+repository = "https://github.com/xiongyaun/quark-drive"
+readme = "../../README.md"
 
 [[bin]]
 name = "quark-probe"

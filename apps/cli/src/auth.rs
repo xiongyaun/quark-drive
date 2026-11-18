@@ -8,7 +8,7 @@ use qrcode::{render, QrCode};
 use quark_protocol::{QrLogin, QrLoginConfig, QrLoginPoll, Session, QR_LOGIN_TTL_MS};
 use tempfile::NamedTempFile;
 
-/// 与桌面版分开存放，logout 不影响桌面版登录状态。
+/// CLI 独立凭据目录，logout 只清除该目录中的会话文件。
 pub struct CredentialStore {
     dir: PathBuf,
 }

@@ -1,20 +1,31 @@
-# Security Policy
+# 安全说明
 
-## Reporting a vulnerability
+本项目是非官方的夸克网盘 Ubuntu 命令行客户端。安全问题请通过维护者的私密联系渠道或 GitHub 私密漏洞报告功能提交；普通公开 Issue 中不要包含真实账号数据。
 
-Please do not open a public issue for credential leaks or exploitable bugs.
-Contact the maintainer privately through the security contact configured on
-the repository, or open a minimal GitHub Security Advisory draft.
+## 凭据与退出登录
 
-Include the affected version, reproduction steps, and impact. Never include
-real cookies, service tickets, QR tokens, or downloaded personal files.
+- CLI 会话默认保存于 `$XDG_DATA_HOME/quark-drive-cli/session.json`；未设置 XDG 时为 `~/.local/share/quark-drive-cli/session.json`。
+- 凭据目录权限为 `0700`，文件权限为 `0600`，写入采用原子替换。凭据是明文 Cookie，不是加密存储。
+- `--data-dir` 会改变凭据目录。请使用专用目录，不要提交账号目录、Cookie 文件或二维码到 Git 仓库。
+- `logout` 只清除当前 CLI 凭据目录中的会话。它不会撤销服务器端会话；如怀疑泄露，请在夸克 App 中撤销对应设备授权并重新登录。
+- `exit` 或关闭终端不等同于退出账号，已保存的登录状态仍可复用。
 
-## Scope
+## 二维码与日志
 
-This project is an unofficial desktop client. It stores the Quark session
-cookie locally in `secrets.json` with mode `0600`; it does not send credentials
-to any server other than Quark's own endpoints.
+二维码包含短期登录 token。`login --qr-output` 创建的 SVG 应在扫码后删除，不要上传到公开平台。
 
-Known limitation: the local secret file is not encrypted at rest. Users on
-shared machines should protect their home directory and report suspected
-credential exposure by revoking the session from the Quark app.
+报告问题时不要附带真实 Cookie、service ticket、二维码 token、签名下载链接、个人文件或含这些信息的终端记录。优先使用本地假服务复现。
+
+Cookie 导入建议使用权限为 `0600` 的 `--cookie-file`，避免写入 shell 历史或进程参数。共享环境中的其他进程可能读取进程环境变量，因此也应谨慎使用 `QUARK_COOKIE`。
+
+## 本地文件与目录传输
+
+- 递归上传会拒绝符号链接和特殊文件。
+- 递归下载验证远端名称，拒绝路径穿越、重复路径及循环目录引用；输出根目录必须不存在，路径不能包含符号链接。
+- 单文件下载可能覆盖指定输出文件；使用 `--resume` 时会检查 Range 响应，避免错误追加。
+- 目录级恢复暂未实现，失败后可能保留部分上传或下载数据。请检查失败结果后再处理，避免误删原文件。
+- `delete` 默认移入回收站；`--permanent` 会永久删除指定条目。
+
+## 报告内容
+
+请提供 CLI 版本、Ubuntu 版本、经过脱敏的复现步骤、预期与实际结果及影响范围。本项目使用系统信任证书进行 HTTPS 校验，请不要通过关闭证书校验来提交复现方案。
