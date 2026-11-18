@@ -2,8 +2,9 @@ name: Ubuntu CLI
 
 on:
   push:
-    branches: [main]
+    branches: [main, sms-only-login]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,8 +32,11 @@ jobs:
         run: |
           mkdir -p dist
           install -m 755 target/release/quark-probe dist/quark-probe
-          cp LICENSE dist/LICENSE
+          cp LICENSE README.md SECURITY.md dist/
+          ./target/release/quark-probe --version > dist/VERSION.txt
+          git rev-parse HEAD >> dist/VERSION.txt
           cargo tree -p quark-cli --edges normal,build --prefix none --format '{p} | {l}' --locked > dist/THIRD-PARTY-LICENSES.txt
+          (cd dist && sha256sum quark-probe LICENSE README.md SECURITY.md VERSION.txt THIRD-PARTY-LICENSES.txt > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
           name: quark-probe-${{ matrix.os }}
