@@ -1,276 +1,283 @@
+//! Official web SMS protocol. Android SecurityGuard payloads are not reused.
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::cookie::{CookieStore, Jar};
-use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, REFERER};
+use reqwest::header::{ACCEPT, ORIGIN, REFERER};
 use reqwest::redirect::Policy;
+use scraper::{Html, Selector};
 use serde_json::Value;
 use url::Url;
 
-use crate::error::{Error, Result};
-use crate::session::Session;
+use crate::{Error, Result, Session};
 
-pub const QR_LOGIN_TTL_MS: i64 = 180_000;
-const CAS_CLIENT_ID: &str = "532";
-const CAS_VERSION: &str = "1.2";
-const QR_LOGIN_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-#[derive(Debug, Clone)]
-pub struct QrLoginConfig {
-    pub token_url: String,
-    pub poll_url: String,
+#[derive(Clone)]
+pub struct SmsLoginConfig {
+    pub login_url: String,
+    pub send_url: String,
+    pub commit_url: String,
     pub account_info_url: String,
-    pub scan_url: String,
-    pub user_agent: String,
     pub timeout_seconds: u64,
 }
 
-impl Default for QrLoginConfig {
+impl Default for SmsLoginConfig {
     fn default() -> Self {
         Self {
-            token_url: "https://uop.quark.cn/cas/ajax/getTokenForQrcodeLogin".to_string(),
-            poll_url: "https://uop.quark.cn/cas/ajax/getServiceTicketByQrcodeToken".to_string(),
-            account_info_url: "https://pan.quark.cn/account/info".to_string(),
-            scan_url: "https://su.quark.cn/4_eMHBJ".to_string(),
-            user_agent: QR_LOGIN_USER_AGENT.to_string(),
+            login_url: "https://uop.quark.cn/cas/custom/login?custom_login_type=mobile&client_id=532&display=pc".into(),
+            send_url: "https://uop.quark.cn/cas/custom/login/sendSmsCode?custom_login_type=mobile".into(),
+            commit_url: "https://uop.quark.cn/cas/custom/login/commit?custom_login_type=mobile".into(),
+            account_info_url: "https://pan.quark.cn/account/info".into(),
             timeout_seconds: 20,
         }
     }
 }
 
-#[derive(Debug)]
-pub enum QrLoginPoll {
-    Waiting,
-    Expired,
-    Success(Session),
+#[derive(Debug, PartialEq, Eq)]
+pub enum SmsSendOutcome {
+    Sent,
+    /// Complete the genuine official-page security verification. Never synthesize its token.
+    BrowserVerificationRequired,
 }
 
-#[derive(Clone)]
-pub struct QrLogin {
+pub struct SmsLogin {
     http: reqwest::Client,
     jar: Arc<Jar>,
-    config: QrLoginConfig,
-    qr_url: String,
+    config: SmsLoginConfig,
+    fields: BTreeMap<String, String>,
+    phone: Option<String>,
+    code_sent: bool,
+    code_length: usize,
 }
 
-impl QrLogin {
-    pub async fn start(config: QrLoginConfig) -> Result<Self> {
+impl SmsLogin {
+    fn new(config: SmsLoginConfig) -> Result<Self> {
         let jar = Arc::new(Jar::default());
         let http = reqwest::Client::builder()
-            .user_agent(&config.user_agent)
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .cookie_provider(jar.clone())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(config.timeout_seconds))
-            .redirect(Policy::limited(10))
+            // Authentication tickets and form values must not follow arbitrary redirects.
+            .redirect(Policy::none())
             .build()?;
-
-        let mut token_url = Url::parse(&config.token_url)?;
-        token_url
-            .query_pairs_mut()
-            .append_pair("client_id", CAS_CLIENT_ID)
-            .append_pair("v", CAS_VERSION)
-            .append_pair("request_id", &uuid::Uuid::new_v4().to_string());
-        let response = http
-            .get(token_url)
-            .header(ACCEPT, "application/json, text/plain, */*")
-            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
-            .header(REFERER, "https://pan.quark.cn/")
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.bytes().await?;
-        if !status.is_success() {
-            return Err(Error::api(
-                status.as_u16() as i64,
-                0,
-                format!("获取扫码登录二维码失败（HTTP {status}）"),
-            ));
-        }
-        let value: Value = serde_json::from_slice(&body)?;
-        if value.get("status").and_then(Value::as_i64) != Some(2_000_000) {
-            return Err(Error::Other(format!(
-                "获取扫码登录二维码失败: {}",
-                api_message(&value)
-            )));
-        }
-        let token = value
-            .get("data")
-            .and_then(|data| data.get("members"))
-            .and_then(|members| members.get("token"))
-            .and_then(Value::as_str)
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| Error::Other("扫码登录响应缺少 token".to_string()))?;
-
-        let mut qr_url = Url::parse(&config.scan_url)?;
-        qr_url
-            .query_pairs_mut()
-            .append_pair("token", token)
-            .append_pair("client_id", CAS_CLIENT_ID)
-            .append_pair("ssb", "weblogin")
-            .append_pair("uc_param_str", "")
-            .append_pair(
-                "uc_biz_str",
-                "S:custom|OPT:SAREA@0|OPT:IMMERSIVE@1|OPT:BACK_BTN_STYLE@0",
-            );
-
         Ok(Self {
             http,
             jar,
             config,
-            qr_url: qr_url.to_string(),
+            fields: BTreeMap::new(),
+            phone: None,
+            code_sent: false,
+            code_length: 4,
         })
     }
 
-    pub fn qr_url(&self) -> &str {
-        &self.qr_url
+    pub async fn start(config: SmsLoginConfig) -> Result<Self> {
+        let mut login = Self::new(config)?;
+        let response = login.http.get(&login.config.login_url).send().await?;
+        if !response.status().is_success() {
+            return Err(Error::Other("无法加载官方短信登录页".into()));
+        }
+        let html = response.text().await?;
+        let (fields, length) = parse_bootstrap(&html)?;
+        login.fields = fields;
+        login.code_length = length;
+        Ok(login)
     }
 
-    pub async fn poll(&self) -> Result<QrLoginPoll> {
-        let mut url = Url::parse(&self.config.poll_url)?;
+    pub fn normalize_phone(phone: &str) -> Result<String> {
+        let phone = phone.trim();
+        let phone = phone.strip_prefix("+86").unwrap_or(phone);
+        if phone.len() != 11
+            || !phone.starts_with('1')
+            || !phone.bytes().all(|b| b.is_ascii_digit())
         {
-            let token = Url::parse(&self.qr_url)?
-                .query_pairs()
-                .find(|(name, _)| name == "token")
-                .map(|(_, value)| value.into_owned())
-                .ok_or_else(|| Error::Other("扫码登录 URL 缺少 token".to_string()))?;
-            url.query_pairs_mut()
-                .append_pair("client_id", CAS_CLIENT_ID)
-                .append_pair("v", CAS_VERSION)
-                .append_pair("token", &token)
-                .append_pair("request_id", &uuid::Uuid::new_v4().to_string());
-        }
-
-        let response = self
-            .http
-            .get(url)
-            .header(ACCEPT, "application/json, text/plain, */*")
-            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
-            .header(REFERER, "https://pan.quark.cn/")
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.bytes().await?;
-        if !status.is_success() {
-            return Err(Error::api(
-                status.as_u16() as i64,
-                0,
-                format!("查询扫码状态失败（HTTP {status}）"),
+            return Err(Error::Other(
+                "该官方短信入口要求中国大陆 11 位手机号码".into(),
             ));
         }
-        let value: Value = serde_json::from_slice(&body)?;
-        let code = value
-            .get("status")
-            .and_then(Value::as_i64)
-            .or_else(|| {
-                value
-                    .get("data")
-                    .and_then(|data| data.get("status"))
-                    .and_then(Value::as_i64)
-            })
-            .unwrap_or_default();
-        match code {
-            2_000_000 => {
-                let ticket = value
-                    .get("data")
-                    .and_then(|data| data.get("members"))
-                    .and_then(|members| members.get("service_ticket"))
-                    .and_then(Value::as_str)
-                    .filter(|ticket| !ticket.is_empty())
-                    .ok_or_else(|| Error::Other("扫码登录响应缺少 service ticket".to_string()))?;
-                self.exchange_ticket(ticket).await
-            }
-            50_004_001 => Ok(QrLoginPoll::Waiting),
-            50_004_002 => Ok(QrLoginPoll::Expired),
-            _ => Err(Error::Other(format!(
-                "查询扫码状态失败: {}",
-                api_message(&value)
-            ))),
-        }
+        Ok(phone.to_owned())
     }
 
-    async fn exchange_ticket(&self, ticket: &str) -> Result<QrLoginPoll> {
+    pub async fn send_code(&mut self, phone: &str) -> Result<SmsSendOutcome> {
+        let phone = Self::normalize_phone(phone)?;
+        // The shipped page obtains these proofs through the real CAPTCHA SDK.
+        // Do not submit empty or fabricated proof when the page requires it.
+        if ["scene_v2", "nc_appkey", "captcha_id"]
+            .iter()
+            .any(|key| self.fields.get(*key).is_some_and(|s| !s.is_empty()))
+        {
+            return Ok(SmsSendOutcome::BrowserVerificationRequired);
+        }
+        self.code_sent = false;
+        let mut form = self.fields.clone();
+        form.insert("login_name".into(), phone.clone());
+        form.remove("sms_code");
+        let value = self.post(&self.config.send_url, &form).await?;
+        if status(&value) == Some(2_000_000) {
+            self.phone = Some(phone);
+            self.code_sent = true;
+            return Ok(SmsSendOutcome::Sent);
+        }
+        if status(&value) == Some(20_180_001)
+            || value.pointer("/data/captchaImage").is_some()
+            || value.pointer("/data/captchaId").is_some()
+        {
+            return Ok(SmsSendOutcome::BrowserVerificationRequired);
+        }
+        Err(api_error(&value, "短信发送未成功"))
+    }
+
+    pub async fn verify_code(&mut self, code: &str) -> Result<Session> {
+        if !self.code_sent {
+            return Err(Error::Other("尚未成功发送短信验证码".into()));
+        }
+        let code = code.trim();
+        if code.len() != self.code_length || !code.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::Other(format!(
+                "短信验证码应为 {} 位数字",
+                self.code_length
+            )));
+        }
+        let mut form = self.fields.clone();
+        form.insert(
+            "login_name".into(),
+            self.phone.clone().ok_or(Error::AuthRequired)?,
+        );
+        form.insert("sms_code".into(), code.to_owned());
+        let value = self.post(&self.config.commit_url, &form).await?;
+        if status(&value) != Some(20_000) {
+            return Err(api_error(&value, "短信验证码校验失败"));
+        }
+        let ticket = value
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Other("短信登录响应缺少服务票据".into()))?;
+        let session = self.exchange(ticket).await?;
+        self.code_sent = false;
+        Ok(session)
+    }
+
+    /// Called only after the official mobile-SMS page returns its ticket.
+    pub async fn finish_official_sms(config: SmsLoginConfig, ticket: &str) -> Result<Session> {
+        Self::new(config)?.exchange(ticket).await
+    }
+
+    async fn post(&self, url: &str, fields: &BTreeMap<String, String>) -> Result<Value> {
+        let response = self
+            .http
+            .post(url)
+            .header(
+                ORIGIN,
+                Url::parse(&self.config.login_url)?
+                    .origin()
+                    .ascii_serialization(),
+            )
+            .header(REFERER, &self.config.login_url)
+            .header(ACCEPT, "application/json")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .form(fields)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(Error::Other(format!(
+                "短信登录请求失败：HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(response.json().await?)
+    }
+
+    async fn exchange(&self, ticket: &str) -> Result<Session> {
+        if ticket.len() != 32 || !ticket.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(Error::Other("官方短信页面返回的服务票据格式无效".into()));
+        }
         let mut url = Url::parse(&self.config.account_info_url)?;
         url.query_pairs_mut()
             .append_pair("st", ticket)
-            .append_pair("lw", "scan");
+            .append_pair("lw", "mobile");
         let response = self
             .http
-            .get(url)
-            .header(ACCEPT, "application/json, text/plain, */*")
-            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
+            .get(url.clone())
             .header(REFERER, "https://pan.quark.cn/")
             .send()
             .await?;
-        let status = response.status();
-        let bytes = response.bytes().await?;
-        if !status.is_success() {
-            return Err(Error::api(
-                status.as_u16() as i64,
-                0,
-                format!("使用扫码凭证登录失败（HTTP {status}）"),
-            ));
+        if !response.status().is_success() {
+            return Err(Error::Other(format!(
+                "建立网盘会话失败：HTTP {}",
+                response.status()
+            )));
         }
-        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-            if value.get("success").and_then(Value::as_bool) == Some(false) {
-                let code = value
-                    .get("code")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                let message = value
-                    .get("msg")
-                    .or_else(|| value.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("扫码凭证无效或已过期");
-                return Err(Error::api(status.as_u16() as i64, code, message));
-            }
+        let value: Value = response.json().await?;
+        if value.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(api_error(&value, "无法建立网盘会话"));
         }
-
-        let session = self.session_from_jar()?;
-        Ok(QrLoginPoll::Success(session))
-    }
-
-    fn session_from_jar(&self) -> Result<Session> {
-        let account_url = Url::parse(&self.config.account_info_url)?;
-        let is_quark_host = account_url
-            .host_str()
-            .is_some_and(|host| host.ends_with("quark.cn"));
-        let mut cookie_header = Vec::new();
-        let mut urls = vec![account_url];
-        if is_quark_host {
-            for host in [
-                "pan.quark.cn",
-                "drive.quark.cn",
-                "drive-pc.quark.cn",
-                "quark.cn",
-                "uop.quark.cn",
-            ] {
-                if let Ok(url) = Url::parse(&format!("https://{host}/")) {
-                    urls.push(url);
-                }
-            }
+        let mut urls = vec![url];
+        for host in [
+            "pan.quark.cn",
+            "drive.quark.cn",
+            "drive-pc.quark.cn",
+            "uop.quark.cn",
+        ] {
+            urls.push(Url::parse(&format!("https://{host}/"))?);
         }
-        for url in &urls {
-            if let Some(value) = self.jar.cookies(url) {
-                if let Ok(text) = value.to_str() {
-                    cookie_header.push(text.to_string());
-                }
-            }
-        }
-        if cookie_header.is_empty() {
-            return Err(Error::InvalidCookie(
-                "扫码登录未返回登录 Cookie，请刷新二维码重试".to_string(),
-            ));
-        }
-        Session::from_cookie_header(&cookie_header.join("; "))
+        let headers = urls
+            .iter()
+            .filter_map(|u| self.jar.cookies(u))
+            .filter_map(|h| h.to_str().ok().map(str::to_owned))
+            .collect::<Vec<_>>();
+        Session::from_cookie_header(&headers.join("; "))
     }
 }
 
-fn api_message(value: &Value) -> String {
-    value
+fn parse_bootstrap(html: &str) -> Result<(BTreeMap<String, String>, usize)> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("form#u_form input[name]")
+        .map_err(|_| Error::Other("无法解析短信登录页".into()))?;
+    let mut fields = BTreeMap::new();
+    let mut length = 4;
+    for input in document.select(&selector) {
+        let element = input.value();
+        let name = element.attr("name").unwrap_or_default();
+        if name == "sms_code" {
+            length = element
+                .attr("maxlength")
+                .and_then(|s| s.parse().ok())
+                .filter(|n| (1..=12).contains(n))
+                .unwrap_or(4);
+        }
+        if !name.is_empty() {
+            fields.insert(
+                name.to_owned(),
+                element.attr("value").unwrap_or_default().to_owned(),
+            );
+        }
+    }
+    if fields.get("client_id").map(String::as_str) != Some("532")
+        || !fields.contains_key("login_name")
+        || !fields.contains_key("sms_code")
+    {
+        return Err(Error::Other(
+            "官方短信登录页结构发生变化，无法安全继续".into(),
+        ));
+    }
+    Ok((fields, length))
+}
+
+fn status(value: &Value) -> Option<i64> {
+    let s = value.get("status").or_else(|| value.get("code"))?;
+    s.as_i64()
+        .or_else(|| s.as_str().and_then(|v| v.parse().ok()))
+}
+fn api_error(value: &Value, fallback: &str) -> Error {
+    let message = value
         .get("message")
         .or_else(|| value.get("msg"))
         .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .unwrap_or("服务端返回异常状态")
-        .to_string()
+        .unwrap_or(fallback);
+    Error::api(
+        200,
+        status(value).unwrap_or(0),
+        message.chars().take(200).collect::<String>(),
+    )
 }

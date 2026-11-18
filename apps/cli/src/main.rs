@@ -1,15 +1,16 @@
 mod auth;
+mod auth_web;
 mod shell;
 mod transfer_tree;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use quark_protocol::{ClientConfig, QuarkClient, Session};
+use quark_protocol::{ClientConfig, QuarkClient};
 use sha2::Digest;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,10 +18,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[derive(Parser)]
 #[command(name = "quark-probe", version, about = "夸克网盘 Ubuntu 命令行客户端")]
 struct Args {
-    #[arg(long, env = "QUARK_COOKIE", hide_env_values = true)]
-    cookie: Option<String>,
-    #[arg(long)]
-    cookie_file: Option<PathBuf>,
     /// CLI 凭据目录（默认 $XDG_DATA_HOME/quark-drive-cli）
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
@@ -34,11 +31,14 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// 使用手机夸克 App 扫码登录并保存凭据
+    /// 仅使用手机号和短信验证码登录
     Login {
-        /// 同时保存 SVG 二维码（适合 SSH 终端无法正常显示时使用）
+        /// 尝试终端短信流程；要求安全验证时转到官方短信页面
         #[arg(long)]
-        qr_output: Option<PathBuf>,
+        phone: Option<String>,
+        /// 本地短信登录页面端口，0 为随机端口
+        #[arg(long, default_value_t = 0)]
+        port: u16,
     },
     /// 清除 CLI 本地登录凭据（不会撤销其他设备会话）
     Logout,
@@ -113,7 +113,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let store = auth::CredentialStore::new(args.data_dir.clone())?;
     match &args.command {
-        Command::Login { qr_output } => return auth::login(&store, qr_output.as_deref()).await,
+        Command::Login { phone, port } => {
+            return auth::login(&store, phone.as_deref(), *port).await
+        }
         Command::Logout => {
             store.clear()?;
             println!("已清除 CLI 本地登录凭据");
@@ -121,12 +123,7 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-    let explicit_cookie = args.cookie.is_some() || args.cookie_file.is_some();
-    let session = if explicit_cookie {
-        Session::from_cookie_header(&read_cookie(&args)?)?
-    } else {
-        store.load()?
-    };
+    let session = store.load()?;
     let client = QuarkClient::new(
         session,
         ClientConfig {
@@ -136,14 +133,12 @@ async fn main() -> Result<()> {
         },
     )?;
     let result = if matches!(args.command, Command::Shell) {
-        shell::run(&client, (!explicit_cookie).then_some(&store)).await
+        shell::run(&client, Some(&store)).await
     } else {
         run_command(&client, args.command).await
     };
-    // 即使命令失败也保存服务端已轮换的 Cookie。显式传入的 Cookie 不写入默认账号。
-    if !explicit_cookie {
-        store.save(&client.session())?;
-    }
+    // 即使命令失败也保存服务端已经轮换的会话。
+    store.save(&client.session())?;
     if let Err(error) = &result {
         if error
             .downcast_ref::<quark_protocol::Error>()
@@ -244,21 +239,6 @@ async fn run_command(client: &QuarkClient, command: Command) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn read_cookie(args: &Args) -> Result<String> {
-    if let Some(cookie) = &args.cookie {
-        return Ok(cookie.trim().to_string());
-    }
-    if let Some(path) = &args.cookie_file {
-        return Ok(std::fs::read_to_string(path)
-            .with_context(|| format!("读取 Cookie 文件失败: {}", path.display()))?
-            .trim()
-            .to_string());
-    }
-    Err(anyhow!(
-        "请通过 --cookie 或 --cookie-file 提供 Cookie，也可设置 QUARK_COOKIE"
-    ))
 }
 
 async fn download(client: &QuarkClient, url: &str, output: &Path, resume: bool) -> Result<()> {
@@ -410,6 +390,7 @@ fn humans(bytes: u64) -> String {
 mod transfer_tests {
     use super::*;
     use axum::{routing::get, Router};
+    use quark_protocol::Session;
 
     #[tokio::test]
     async fn ignored_resume_range_never_appends_full_response() -> Result<()> {
@@ -434,5 +415,21 @@ mod transfer_tests {
         assert_eq!(std::fs::read(&path)?, b"prefix");
         server.abort();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod auth_command_tests {
+    use super::*;
+    #[test]
+    fn only_sms_login_is_exposed() {
+        assert!(Args::try_parse_from(["quark-probe", "login", "--port", "18764"]).is_ok());
+        for args in [
+            vec!["quark-probe", "--cookie", "secret", "member"],
+            vec!["quark-probe", "--cookie-file", "cookie.txt", "member"],
+            vec!["quark-probe", "login", "--qr-output", "qr.svg"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
     }
 }

@@ -4,7 +4,7 @@ mod error;
 mod models;
 mod session;
 
-pub use auth::{QrLogin, QrLoginConfig, QrLoginPoll, QR_LOGIN_TTL_MS};
+pub use auth::{SmsLogin, SmsLoginConfig, SmsSendOutcome};
 pub use client::{
     build_complete_xml, header_value, part_auth_meta, set_cookie_headers, ClientConfig,
     QuarkClient, SecretClient, DEFAULT_QUARK_USER_AGENT,

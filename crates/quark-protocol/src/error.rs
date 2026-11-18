@@ -37,7 +37,7 @@ pub enum Error {
 
 impl From<reqwest::Error> for Error {
     fn from(error: reqwest::Error) -> Self {
-        // Strip the request URL: signed download URLs and QR tokens can appear
+        // Strip the request URL: signed download URLs and service tickets can appear
         // in query strings, and this error is surfaced to logs and the UI.
         Self::Http(error.without_url())
     }

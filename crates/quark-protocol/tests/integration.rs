@@ -1,11 +1,8 @@
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use quark_protocol::{
-    ClientConfig, QrLogin, QrLoginConfig, QrLoginPoll, QuarkClient, Session, DEFAULT_SORT,
-};
+use quark_protocol::{ClientConfig, QuarkClient, Session, DEFAULT_SORT};
 use quark_testkit::FakeQuarkServer;
-use url::Url;
 
 fn client_for(server: &FakeQuarkServer) -> QuarkClient {
     let session = Session::from_cookie_header("__puus=old; __pus=pus; __uid=test").unwrap();
@@ -114,79 +111,4 @@ async fn retryable_errors_are_marked() {
     assert!(error.retryable());
     let page = client.list_dir("0", 1, 100, DEFAULT_SORT).await.unwrap();
     assert_eq!(page.total, 2);
-}
-
-#[tokio::test]
-async fn qr_login_shares_cookies_and_lists_files() {
-    let server = FakeQuarkServer::start().await;
-    let config = QrLoginConfig {
-        token_url: server.qr_token_url(),
-        poll_url: server.qr_poll_url(),
-        account_info_url: server.qr_account_info_url(),
-        scan_url: server.qr_scan_url(),
-        ..QrLoginConfig::default()
-    };
-    let login = QrLogin::start(config).await.unwrap();
-    let qr_url = Url::parse(login.qr_url()).unwrap();
-    assert_eq!(qr_url.path(), "/qr/scan");
-    let query = qr_url
-        .query_pairs()
-        .collect::<std::collections::HashMap<_, _>>();
-    assert_eq!(
-        query.get("token").map(|value| value.as_ref()),
-        Some("fake-qr-token")
-    );
-    assert_eq!(
-        query.get("client_id").map(|value| value.as_ref()),
-        Some("532")
-    );
-    assert_eq!(
-        query.get("ssb").map(|value| value.as_ref()),
-        Some("weblogin")
-    );
-
-    assert!(matches!(login.poll().await.unwrap(), QrLoginPoll::Waiting));
-
-    server.state.lock().unwrap().qr_ticket_ready = true;
-    let session = match login.poll().await.unwrap() {
-        QrLoginPoll::Success(session) => session,
-        other => panic!("expected QR login success, got {other:?}"),
-    };
-    assert_eq!(session.get("__pus"), Some("fake-pus"));
-    assert_eq!(session.get("__puus"), None);
-
-    let client = QuarkClient::new(
-        session,
-        ClientConfig {
-            api_base: server.api_base(),
-            pc_api_base: server.api_base(),
-            account_base: server.base_url.clone(),
-            oss_base_override: Some(server.oss_base()),
-            ..ClientConfig::default()
-        },
-    )
-    .unwrap();
-    let page = client.list_dir("0", 1, 100, DEFAULT_SORT).await.unwrap();
-    assert_eq!(page.total, 2);
-    assert_eq!(client.session().get("__puus"), Some("rotated"));
-
-    let state = server.state.lock().unwrap();
-    assert_eq!(state.qr_token_calls, 1);
-    assert_eq!(state.qr_poll_calls, 2);
-    assert_eq!(state.qr_account_info_calls, 1);
-}
-
-#[tokio::test]
-async fn qr_login_reports_expired_code() {
-    let server = FakeQuarkServer::start().await;
-    let config = QrLoginConfig {
-        token_url: server.qr_token_url(),
-        poll_url: server.qr_poll_url(),
-        account_info_url: server.qr_account_info_url(),
-        scan_url: server.qr_scan_url(),
-        ..QrLoginConfig::default()
-    };
-    let login = QrLogin::start(config).await.unwrap();
-    server.state.lock().unwrap().qr_expired = true;
-    assert!(matches!(login.poll().await.unwrap(), QrLoginPoll::Expired));
 }

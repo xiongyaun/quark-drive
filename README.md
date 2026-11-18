@@ -1,12 +1,12 @@
 # 夸克网盘 Ubuntu CLI
 
-在 Ubuntu 终端或 SSH 中使用夸克网盘。程序名为 `quark-probe`，支持手机扫码登录、文件管理、交互目录操作和递归上传下载。多文件目录下载默认同时传输 **3 个文件**。
+在 Ubuntu 终端或 SSH 中使用夸克网盘。程序名为 `quark-probe`，支持手机号与短信验证码登录、文件管理、交互目录操作和递归上传下载。多文件目录下载默认同时传输 **3 个文件**。
 
 本项目是非官方客户端，基于 [xingzhe11011/quark-drive](https://github.com/xingzhe11011/quark-drive) 的 Rust 协议实现改造，使用 MIT 许可证。使用夸克网页端接口，不绕过会员、限速或付费能力；接口变化可能需要更新客户端。
 
 ## 功能
 
-- 扫码登录、自动保存和恢复登录状态、保存轮换后的 Cookie、退出本地登录。
+- 手机短信登录、自动保存和恢复登录状态、保存轮换后的 Cookie、退出本地登录。
 - 查看账号信息与容量，按 FID 列出目录、分页浏览。
 - 交互模式：`ls`、`refresh`、`pwd`、`cd`、`cd ..`、`cd /`、`exit`。
 - 单文件上传、秒传检测、分片上传、下载和下载断点续传。
@@ -41,26 +41,35 @@ install -m 755 target/release/quark-probe ~/.local/bin/quark-probe
 
 下文使用安装后的 `quark-probe`；也可替换为 `./target/release/quark-probe`。程序使用 Rustls 和系统信任证书。
 
-## 扫码登录与退出
+## 手机短信登录与退出
 
 ```bash
 quark-probe login
 ```
 
-用手机夸克 App 扫描终端二维码并确认。二维码约 3 分钟有效，超时后重新运行；按 Ctrl+C 取消。SSH 终端显示异常时，可以同时保存 SVG，传到本机打开扫码：
+程序监听本机回环地址并输出登录链接。在浏览器中打开该链接，在嵌入的夸克官方页面输入手机号，完成官方安全验证并接收、填写短信验证码。登录窗口有效期为 10 分钟；按 Ctrl+C 取消。当前官方页面可能要求滑块验证，需要用户手动完成。
+
+在 SSH 中运行时，选择固定端口：
 
 ```bash
-quark-probe login --qr-output ./login.svg
+# 本机建立 SSH 转发，替换 USER 和 SERVER
+ssh -L 18764:127.0.0.1:18764 USER@SERVER
+# 在服务器运行，然后在本机浏览器打开程序输出的链接
+quark-probe login --port 18764
 ```
 
-SVG 目标文件必须不存在。二维码包含短期登录 token，使用后删除，不要公开分享。
+不要将登录端口暴露到公网，不要分享含随机标识的完整登录链接。
+
+也提供 `quark-probe login --phone PHONE_NUMBER`：仅当官方接口无需浏览器验证时，在终端接收验证码输入；官方要求安全验证时自动转入上述官方页面流程。手机号作为参数可能出现在命令历史或进程信息中，优先使用默认登录。
+
+登录只使用手机号和短信验证码，不支持扫码、密码、Cookie 导入或 `QUARK_COOKIE`。CLI 接收官方页面返回的短期票据，交换并保存自己的网盘会话。
 
 ```bash
 quark-probe member
 quark-probe logout
 ```
 
-`logout` 删除 CLI 本地凭据，下次需要重新扫码。它不撤销服务器端会话；需要撤销设备授权时，请在夸克 App 中管理登录设备。
+`logout` 删除 CLI 本地凭据，下次需要重新短信登录。它不撤销服务器端会话；需要撤销设备授权时，请在夸克 App 中管理登录设备。
 
 默认凭据为 `$XDG_DATA_HOME/quark-drive-cli/session.json`，未设置 XDG 时使用 `~/.local/share/quark-drive-cli/session.json`。目录权限为 `0700`，文件权限为 `0600`，采用原子替换写入。后续命令会自动使用保存的会话，失效时提示重新登录。
 
@@ -150,17 +159,6 @@ quark-probe delete --fid FILE_OR_DIRECTORY_FID
 
 删除默认移入回收站。添加 `--permanent` 会永久删除指定条目。交互模式使用 `mkdir --name "新文件夹"` 在当前目录内创建文件夹。
 
-## 兼容 Cookie 导入
-
-可通过 `--cookie-file`、`--cookie` 或 `QUARK_COOKIE` 提供 Cookie。建议用文件，避免把 Cookie 留在命令历史或进程参数中：
-
-```bash
-chmod 600 cookie.txt
-quark-probe --cookie-file cookie.txt member
-```
-
-显式提供的 Cookie 优先于保存的扫码会话，不会覆盖已保存的账号凭据。`--cookie`（包括环境变量 `QUARK_COOKIE`）的优先级高于 `--cookie-file`。
-
 ## 检查与验证
 
 ```bash
@@ -172,13 +170,15 @@ cargo build --release -p quark-cli --locked
 
 自动测试使用本地假服务，不需要真实账号。`crates/quark-testkit` 仅供测试协议和传输流程。
 
-已在云端 Debian x86_64 环境完成真实账号测试：扫码登录、文件管理、512 MiB 随机文件真实分片上传，以及 200 MiB、5 级子目录的递归往返。目录测试包含 16 个文件和 10 个子目录，全部相对路径、大小、SHA-256 和空目录一致；下载并发峰值为 3。上述测试不代表所有网络环境或所有 Ubuntu 版本的速度。
+短信版本已完成本地模拟服务测试，涵盖验证码发送、校验、票据换会话、错误验证码、官方安全验证分支和回环回调校验。真实官方页面已加载，并使用经授权的号码点击一次获取验证码：页面要求人工滑块验证，尚未确认发送短信，真实短信登录和登录后网盘会话验证仍待完成。此版本不能视为已通过真实账号端到端验证。
+
+此前会话版本曾完成 512 MiB 随机文件上传和 200 MiB、5 级子目录往返测试，16 个文件与 10 个子目录的路径、大小、SHA-256 和空目录一致，并发峰值为 3；这些历史结果不替代新短信登录验证。
 
 ## 项目结构与限制
 
 ```text
 apps/cli/                 Ubuntu CLI、登录、交互目录和递归传输
-crates/quark-protocol/     HTTP 协议、会话、扫码和传输接口
+crates/quark-protocol/     HTTP 协议、会话、短信和传输接口
 crates/quark-testkit/      本地假服务和测试辅助
 .github/workflows/        Ubuntu 构建、检查和产物
 ```

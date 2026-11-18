@@ -25,11 +25,6 @@ pub struct FakeState {
     pub download_delay_ms: u64,
     pub download_bytes: Vec<u8>,
     pub fail_next_list: bool,
-    pub qr_token_calls: usize,
-    pub qr_poll_calls: usize,
-    pub qr_account_info_calls: usize,
-    pub qr_ticket_ready: bool,
-    pub qr_expired: bool,
     pub recycle_items: Vec<Value>,
     pub recycle_restore_calls: usize,
     pub recycle_remove_calls: usize,
@@ -53,11 +48,6 @@ impl Default for FakeState {
             download_delay_ms: 0,
             download_bytes,
             fail_next_list: false,
-            qr_token_calls: 0,
-            qr_poll_calls: 0,
-            qr_account_info_calls: 0,
-            qr_ticket_ready: false,
-            qr_expired: false,
             recycle_items: vec![
                 json!({
                     "record_id": "record-1",
@@ -118,9 +108,7 @@ impl FakeQuarkServer {
             .route("/1/clouddrive/file/upload/finish", post(upload_finish))
             .route("/oss/{*path}", put(upload_part).post(complete_upload))
             .route("/download/{fid}", get(download))
-            .route("/qr/token", get(qr_token))
-            .route("/qr/poll", get(qr_poll))
-            .route("/account/info", get(qr_account_info))
+            .route("/account/info", get(account_info))
             .layer(middleware::from_fn(require_api_headers))
             .with_state(state.clone());
 
@@ -147,22 +135,6 @@ impl FakeQuarkServer {
 
     pub fn oss_base(&self) -> String {
         format!("{}/oss", self.base_url)
-    }
-
-    pub fn qr_token_url(&self) -> String {
-        format!("{}/qr/token", self.base_url)
-    }
-
-    pub fn qr_poll_url(&self) -> String {
-        format!("{}/qr/poll", self.base_url)
-    }
-
-    pub fn qr_account_info_url(&self) -> String {
-        format!("{}/account/info", self.base_url)
-    }
-
-    pub fn qr_scan_url(&self) -> String {
-        format!("{}/qr/scan", self.base_url)
     }
 }
 
@@ -199,127 +171,12 @@ async fn require_api_headers(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-fn assert_cookie_contains(headers: &HeaderMap, expected: &str) {
-    let cookie = headers
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    assert!(
-        cookie.contains(expected),
-        "request cookie does not contain {expected}"
-    );
-}
-
-fn assert_cas_query(query: &HashMap<String, String>, with_token: bool) {
-    assert_eq!(query.get("client_id").map(String::as_str), Some("532"));
-    assert_eq!(query.get("v").map(String::as_str), Some("1.2"));
-    let request_id = query
-        .get("request_id")
-        .expect("CAS request must include request_id");
-    let valid_uuid = request_id.len() == 36
-        && request_id
-            .chars()
-            .enumerate()
-            .all(|(index, ch)| match index {
-                8 | 13 | 18 | 23 => ch == '-',
-                _ => ch.is_ascii_hexdigit(),
-            });
-    assert!(valid_uuid, "request_id is not a UUID: {request_id}");
-    assert_eq!(query.contains_key("token"), with_token);
-}
-
 async fn config() -> Response {
     ok(json!({}), json!({}))
 }
 
-async fn qr_token(
-    State(state): State<SharedState>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    assert_cas_query(&query, false);
-    state.lock().expect("fake state").qr_token_calls += 1;
-    (
-        [(header::SET_COOKIE, "qr_prep=ready; Path=/; HttpOnly")],
-        Json(json!({
-            "status": 2_000_000,
-            "data": {"members": {"token": "fake-qr-token"}}
-        })),
-    )
-        .into_response()
-}
-
-async fn qr_poll(
-    State(state): State<SharedState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    assert_cas_query(&query, true);
-    assert_eq!(
-        query.get("token").map(String::as_str),
-        Some("fake-qr-token")
-    );
-    assert_cookie_contains(&headers, "qr_prep=ready");
-    let (expired, ready) = {
-        let mut guard = state.lock().expect("fake state");
-        guard.qr_poll_calls += 1;
-        (guard.qr_expired, guard.qr_ticket_ready)
-    };
-    if expired {
-        return Json(json!({
-            "status": 50_004_002,
-            "message": "二维码已过期"
-        }))
-        .into_response();
-    }
-    if ready {
-        Json(json!({
-            "status": 2_000_000,
-            "data": {"members": {"service_ticket": "fake-service-ticket"}}
-        }))
-        .into_response()
-    } else {
-        Json(json!({
-            "status": 50_004_001,
-            "message": "Query result is empty"
-        }))
-        .into_response()
-    }
-}
-
-async fn qr_account_info(
-    State(state): State<SharedState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    if !query.contains_key("st") {
-        return Json(json!({
-            "success": true,
-            "code": "OK",
-            "data": {
-                "nickname": "测试用户",
-                "avatarUri": "http://image.quark.cn/avatar/test.png"
-            }
-        }))
-        .into_response();
-    }
-    assert_eq!(
-        query.get("st").map(String::as_str),
-        Some("fake-service-ticket")
-    );
-    assert_eq!(query.get("lw").map(String::as_str), Some("scan"));
-    assert_cookie_contains(&headers, "qr_prep=ready");
-    state.lock().expect("fake state").qr_account_info_calls += 1;
-    let mut response =
-        Json(json!({"success": true, "data": {"nickname": "测试用户"}})).into_response();
-    response.headers_mut().append(
-        header::SET_COOKIE,
-        HeaderValue::from_static("__pus=fake-pus; Path=/; SameSite=Lax"),
-    );
-    response.headers_mut().append(
-        header::SET_COOKIE,
-        HeaderValue::from_static("__uid=test-uid; Path=/; SameSite=Lax"),
-    );
-    response
+async fn account_info() -> Response {
+    Json(json!({"success":true,"code":"OK","data":{"nickname":"测试用户","avatarUri":"http://image.quark.cn/avatar/test.png"}})).into_response()
 }
 
 async fn member() -> Response {

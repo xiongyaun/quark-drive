@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+scraper = "0.24"
 base64.workspace = true
 bytes.workspace = true
 cookie.workspace = true
@@ -17,7 +18,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 axum = "0.8"

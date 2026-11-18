@@ -14,10 +14,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
-clap = { workspace = true, features = ["env"] }
+clap.workspace = true
 futures-util.workspace = true
 dirs.workspace = true
-qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+axum = "0.8"
+url.workspace = true
+uuid.workspace = true
 tempfile = "3"
 httpdate.workspace = true
 md-5.workspace = true
@@ -32,5 +34,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-axum = "0.8"
+reqwest.workspace = true
 quark-testkit = { path = "../../crates/quark-testkit" }

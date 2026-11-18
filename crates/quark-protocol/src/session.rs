@@ -60,7 +60,7 @@ impl Session {
         }
         if !session.is_authenticated() {
             return Err(Error::InvalidCookie(
-                "登录窗口未返回有效 Cookie，请重新扫码登录".to_string(),
+                "会话未返回有效凭据，请重新使用手机验证码登录".to_string(),
             ));
         }
         Ok(session)
