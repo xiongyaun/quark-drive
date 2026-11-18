@@ -143,25 +143,112 @@ npm run build:debug
 
 备用方式：登录页展开“Cookie 导入”，粘贴完整 Cookie（至少包含 `__pus` 或 `__puus`）。适合自动化验收或无 GUI 环境。
 
-## 命令行探针
+## Ubuntu / SSH 命令行
 
-`quark-probe` 用来快速验证协议和做最终验收，不会启动 UI：
+`quark-probe` 可以独立编译运行，不需要 Node.js、GTK、WebKit 或桌面环境。
+安装 Git、C 编译器和 Rust stable 工具链后，在仓库根目录执行：
 
 ```bash
-export QUARK_COOKIE='__puus=...; __pus=...; __uid=...'
-
-cargo run -p quark-cli -- member
-cargo run -p quark-cli -- ls --fid 0
-cargo run -p quark-cli -- upload --file ./test.bin --parent 0
-cargo run -p quark-cli -- download --fid <fid> --output ./test.download
+cargo build --release -p quark-cli --locked
+./target/release/quark-probe --help
 ```
 
-也可以使用文件，避免 Cookie 进入 shell 历史：
+可选：将 `target/release/quark-probe` 放到自己的 `~/.local/bin/` 中。
+Ubuntu 的基础构建依赖可用 `sudo apt install git build-essential` 安装；Rust 工具链见
+<https://rustup.rs/>。CLI 使用 Rustls 和系统信任证书，无需 OpenSSL 开发库；Ubuntu 请安装 `ca-certificates`。
+
+### 扫码登录
+
+```bash
+./target/release/quark-probe login
+# SSH 终端显示异常时，同时输出 SVG 文件，再传到本机打开扫码：
+./target/release/quark-probe login --qr-output ./quark-login.svg
+```
+
+使用手机夸克 App 扫码并确认。二维码约 3 分钟有效，过期或超时后重新运行；
+Ctrl+C 可取消，失败或取消不会替换原有凭据。SVG 路径必须不存在，工具不会覆盖已有文件。
+终端输出包含 ANSI 黑白颜色和 Unicode 块字符，建议终端使用 UTF-8 并保持足够宽度。
+二维码链接含短期登录 token，SVG 请在使用后删除，不要公开分享。
+
+登录状态默认保存到 `$XDG_DATA_HOME/quark-drive-cli/session.json`，未设置 XDG 时为
+`~/.local/share/quark-drive-cli/session.json`。目录权限 `0700`，凭据文件权限 `0600`，
+写入采用原子替换。CLI 与桌面版使用独立凭据。
+后续命令自动读取凭据，并保存请求过程中轮换的 Cookie；服务端判定失效时提示重新登录。
+
+```bash
+./target/release/quark-probe member
+./target/release/quark-probe ls --fid 0
+./target/release/quark-probe upload --file ./test.bin --parent 0
+./target/release/quark-probe download --fid FILE_FID --output ./test.download
+./target/release/quark-probe logout
+```
+
+`logout` 只删除本机 CLI 凭据，不会撤销服务器会话或退出手机/桌面客户端。
+自定义目录适用于多个账号；每次命令使用同一个目录，不要在多个进程中同时修改同一账号凭据：
+
+```bash
+./target/release/quark-probe --data-dir ./my-account login
+./target/release/quark-probe --data-dir ./my-account ls
+./target/release/quark-probe --data-dir ./my-account logout
+```
+
+### 交互目录操作
+
+```bash
+./target/release/quark-probe shell
+```
+
+进入后可使用以下命令。目录位置仅在当前交互会话内有效，每次启动从根目录开始；
+`ls` 与 `refresh` 都直接向服务器请求，不读取目录缓存。`cd` 支持当前目录下的名称或 FID，
+并检查目标确实是目录；包含空格的名称和本地路径请加引号。
+
+```text
+pwd
+ls
+cd "我的备份"
+refresh
+mkdir --name "CLI 测试"
+cd "CLI 测试"
+upload --file "/home/user/test file.bin"
+refresh
+download --fid FILE_FID --output ./test.download
+cd ..
+cd /
+exit
+```
+
+`exit` / `quit` / Ctrl+D / Ctrl+C 退出交互模式并保留登录状态；`logout` 是独立命令。
+每次交互操作后都会保存轮换后的 Cookie。`cd` 不提供多段路径解析。
+下载使用 `--resume` 时会验证服务器的 Range 响应，响应偏移不匹配时停止写入，保护已有文件。
+
+### 递归上传和下载文件夹
+
+```bash
+# 上传整个本地目录（包括所有子目录和空目录）到指定云端目录下
+./target/release/quark-probe upload --file ./测试目录 --parent PARENT_FID --recursive
+# 下载指定云端目录；output 就是下载后的根目录，必须尚不存在
+./target/release/quark-probe download --fid DIRECTORY_FID --output ./目录下载 --recursive
+# 默认同时下载 3 个文件，可按需调整为 1 到 32
+./target/release/quark-probe download --fid DIRECTORY_FID --output ./另一个目录 --recursive --concurrency 3
+```
+
+`--recursive` 可简写成 `-r`，交互模式的 `upload` / `download` 也支持这些选项。
+上传会在云端父目录下创建与本地目录同名的根目录；已存在同名条目时停止，避免意外合并。
+下载递归读取分页目录，保留相对路径和空目录；默认最多同时传输 3 个文件，不是单文件 3 连接。
+本地上传不接受符号链接和特殊文件，下载不覆盖已有根目录。目录下载暂不支持 `--resume`，
+失败时会保留已传输的部分数据并返回错误；重新测试请使用新的目录名称或输出路径。
+
+### 兼容 Cookie 导入
+
+仍支持 `--cookie-file`、`--cookie` 和 `QUARK_COOKIE`。显式提供 Cookie 时优先使用它，
+不会覆盖扫码登录保存的账号；建议用文件，避免 Cookie 进入 shell 历史或进程参数：
 
 ```bash
 chmod 600 cookie.txt
-cargo run -p quark-cli -- --cookie-file cookie.txt member
+./target/release/quark-probe --cookie-file cookie.txt member
 ```
+
+CLI 当前通过 FID 操作，尚未提供多段路径解析、自动同步和 FUSE 挂载。
 
 ## 验收
 

@@ -1,3 +1,7 @@
+mod auth;
+mod shell;
+mod transfer_tree;
+
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -10,13 +14,16 @@ use sha2::Digest;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "quark-probe", version, about = "夸克网盘协议探针与命令行工具")]
 struct Args {
-    #[arg(long, env = "QUARK_COOKIE")]
+    #[arg(long, env = "QUARK_COOKIE", hide_env_values = true)]
     cookie: Option<String>,
     #[arg(long)]
     cookie_file: Option<PathBuf>,
+    /// CLI 凭据目录（默认 $XDG_DATA_HOME/quark-drive-cli）
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
     #[arg(long, default_value = "https://drive.quark.cn/1/clouddrive")]
     api_base: String,
     #[arg(long, default_value = "https://drive-pc.quark.cn/1/clouddrive")]
@@ -27,6 +34,16 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// 使用手机夸克 App 扫码登录并保存凭据
+    Login {
+        /// 同时保存 SVG 二维码（适合 SSH 终端无法正常显示时使用）
+        #[arg(long)]
+        qr_output: Option<PathBuf>,
+    },
+    /// 清除 CLI 本地登录凭据（不会撤销其他设备会话）
+    Logout,
+    /// 进入交互模式，支持 cd / pwd / refresh / exit
+    Shell,
     /// 打印账号信息和容量
     Member,
     /// 列出目录
@@ -46,13 +63,22 @@ enum Command {
         output: PathBuf,
         #[arg(long, default_value_t = false)]
         resume: bool,
+        /// 递归下载目录，output 必须是尚不存在的新目录
+        #[arg(long, short = 'r')]
+        recursive: bool,
+        /// 目录下载时同时传输的文件数
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(1..=32))]
+        concurrency: u16,
     },
     /// 上传文件
     Upload {
-        #[arg(long)]
+        #[arg(long, alias = "path")]
         file: PathBuf,
         #[arg(long, default_value = "0")]
         parent: String,
+        /// 将整个目录及其子目录上传到 parent 下
+        #[arg(long, short = 'r')]
+        recursive: bool,
     },
     /// 新建文件夹
     Mkdir {
@@ -85,18 +111,55 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
-    let cookie = read_cookie(&args)?;
-    let session = Session::from_cookie_header(&cookie)?;
+    let store = auth::CredentialStore::new(args.data_dir.clone())?;
+    match &args.command {
+        Command::Login { qr_output } => return auth::login(&store, qr_output.as_deref()).await,
+        Command::Logout => {
+            store.clear()?;
+            println!("已清除 CLI 本地登录凭据");
+            return Ok(());
+        }
+        _ => {}
+    }
+    let explicit_cookie = args.cookie.is_some() || args.cookie_file.is_some();
+    let session = if explicit_cookie {
+        Session::from_cookie_header(&read_cookie(&args)?)?
+    } else {
+        store.load()?
+    };
     let client = QuarkClient::new(
         session,
         ClientConfig {
-            api_base: args.api_base,
-            pc_api_base: args.pc_api_base,
+            api_base: args.api_base.clone(),
+            pc_api_base: args.pc_api_base.clone(),
             ..ClientConfig::default()
         },
     )?;
+    let result = if matches!(args.command, Command::Shell) {
+        shell::run(&client, (!explicit_cookie).then_some(&store)).await
+    } else {
+        run_command(&client, args.command).await
+    };
+    // 即使命令失败也保存服务端已轮换的 Cookie。显式传入的 Cookie 不写入默认账号。
+    if !explicit_cookie {
+        store.save(&client.session())?;
+    }
+    if let Err(error) = &result {
+        if error
+            .downcast_ref::<quark_protocol::Error>()
+            .is_some_and(|e| e.is_auth())
+        {
+            eprintln!("登录状态已失效，请重新运行 quark-probe login");
+        }
+    }
+    result
+}
 
-    match args.command {
+async fn run_command(client: &QuarkClient, command: Command) -> Result<()> {
+    match command {
+        Command::Login { .. } | Command::Logout | Command::Shell => {
+            unreachable!("auth handled before client creation")
+        }
         Command::Member => {
             let member = client.member_info().await?;
             println!("{}", serde_json::to_string_pretty(&member)?);
@@ -125,18 +188,36 @@ async fn main() -> Result<()> {
             fid,
             output,
             resume,
+            recursive,
+            concurrency,
         } => {
+            if recursive {
+                anyhow::ensure!(!resume, "目录下载暂不支持 --resume，请使用新的输出目录");
+                transfer_tree::download_dir(client, &fid, &output, usize::from(concurrency))
+                    .await?;
+                return Ok(());
+            }
             let url = client
                 .download_urls(&[fid])
                 .await?
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("没有下载地址"))?;
-            download(&client, &url.download_url, &output, resume).await?;
+            download(client, &url.download_url, &output, resume).await?;
             println!("已下载到 {}", output.display());
         }
-        Command::Upload { file, parent } => {
-            upload(&client, &file, &parent).await?;
+        Command::Upload {
+            file,
+            parent,
+            recursive,
+        } => {
+            if recursive {
+                let fid = transfer_tree::upload_dir(client, &file, &parent).await?;
+                println!("目录上传完成，FID: {fid}");
+                return Ok(());
+            }
+            anyhow::ensure!(!file.is_dir(), "上传目录请添加 --recursive（或 -r）");
+            upload(client, &file, &parent).await?;
             println!("上传完成: {}", file.display());
             let name = file
                 .file_name()
@@ -193,7 +274,22 @@ async fn download(client: &QuarkClient, url: &str, output: &Path, resume: bool) 
     if !response.status().is_success() {
         return Err(anyhow!("下载失败: HTTP {}", response.status()));
     }
-    if let Some(parent) = output.parent() {
+    // 续传必须确认响应确实从所需偏移开始，避免把完整文件再次追加到末尾。
+    if start > 0 || response.status().as_u16() == 206 {
+        let actual_start = response
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes "))
+            .and_then(|value| value.split_once('-'))
+            .and_then(|(first, _)| first.parse::<u64>().ok());
+        if response.status().as_u16() != 206 || actual_start != Some(start) {
+            return Err(anyhow!(
+                "服务器未返回正确的 Range 响应，已停止下载以保护本地文件；可去掉 --resume 重新下载"
+            ));
+        }
+    }
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = tokio::fs::OpenOptions::new()
@@ -308,4 +404,35 @@ fn humans(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.2} {}", UNITS[unit])
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use axum::{routing::get, Router};
+
+    #[tokio::test]
+    async fn ignored_resume_range_never_appends_full_response() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/file", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/file", get(|| async { "full-body" })),
+            )
+            .await
+            .unwrap();
+        });
+        let client = QuarkClient::new(
+            Session::from_cookie_header("__puus=fake")?,
+            ClientConfig::default(),
+        )?;
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("partial.bin");
+        std::fs::write(&path, b"prefix")?;
+        assert!(download(&client, &url, &path, true).await.is_err());
+        assert_eq!(std::fs::read(&path)?, b"prefix");
+        server.abort();
+        Ok(())
+    }
 }
